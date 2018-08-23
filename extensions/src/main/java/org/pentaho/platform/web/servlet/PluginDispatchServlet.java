@@ -26,16 +26,22 @@ import org.apache.commons.logging.LogFactory;
 import org.pentaho.platform.api.engine.IPluginManager;
 import org.pentaho.platform.api.engine.IPluginManagerListener;
 import org.pentaho.platform.engine.core.system.PentahoSystem;
+import org.pentaho.platform.web.websocket.EndpointConfig;
 import org.springframework.beans.factory.BeanFactoryUtils;
 import org.springframework.beans.factory.ListableBeanFactory;
 
 import javax.servlet.Servlet;
 import javax.servlet.ServletConfig;
+import javax.servlet.ServletContext;
 import javax.servlet.ServletException;
 import javax.servlet.ServletRequest;
 import javax.servlet.ServletResponse;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import javax.websocket.DeploymentException;
+import javax.websocket.Endpoint;
+import javax.websocket.server.ServerContainer;
+import javax.websocket.server.ServerEndpointConfig;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.HashMap;
@@ -58,6 +64,8 @@ public class PluginDispatchServlet implements Servlet {
   private IPluginManager pluginManager = PentahoSystem.get( IPluginManager.class );
 
   private Map<String, Servlet> pluginServletMap = new HashMap<String, Servlet>();
+
+  private static final String WEBSOCKET_PLUGIN_PATH_PREFIX = "websocket";
 
   public PluginDispatchServlet() {
     super();
@@ -176,6 +184,8 @@ public class PluginDispatchServlet implements Servlet {
     }
     pluginServletMap.clear();
 
+    ServletContext servletContext = null;
+
     Map<String, ListableBeanFactory> pluginBeanFactoryMap = getPluginBeanFactories();
 
     for ( Map.Entry<String, ListableBeanFactory> pluginBeanFactoryEntry : pluginBeanFactoryMap.entrySet() ) {
@@ -206,6 +216,47 @@ public class PluginDispatchServlet implements Servlet {
           pluginServlet.init( servletConfig );
         } catch ( Throwable t ) {
           logger.error( "Could not load servlet '" + context + "'", t ); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+        }
+      }
+
+      // Register websocket endpoints configured in the plugin
+      Map<String, EndpointConfig> wsBeans = BeanFactoryUtils.beansOfTypeIncludingAncestors( pluginBeanFactoryEntry.getValue(),
+        EndpointConfig.class, true, true );
+
+      if ( servletContext == null ) {
+        servletContext = getServletConfig().getServletContext();
+      }
+
+      for ( Map.Entry<String, EndpointConfig> beanEntry : wsBeans.entrySet() ) {
+        Map<String, Class<? extends Endpoint>> pluginEndpointConfigsList = beanEntry.getValue().getEndpoints();
+        String pluginId = pluginBeanFactoryEntry.getKey();
+
+        if ( logger.isDebugEnabled() ) {
+          logger.debug( "found " + pluginEndpointConfigsList.size() + " websocket endpoints in " + pluginBeanFactoryEntry.getKey() );
+        }
+
+        for ( Map.Entry<String, Class<? extends Endpoint>> endpointConfig : pluginEndpointConfigsList.entrySet() ) {
+          Class<? extends Endpoint> pluginEndpointClass = endpointConfig.getValue();
+          String contextPath = endpointConfig.getKey();
+          String context = "/" + pluginId + "/" + WEBSOCKET_PLUGIN_PATH_PREFIX + "/" + contextPath;
+
+          try {
+            ServerEndpointConfig serverConfig = ServerEndpointConfig.Builder.create( pluginEndpointClass, context ).
+              configurator( new ServerEndpointConfig.Configurator() {
+                @Override public boolean checkOrigin( String originHeaderValue ) {
+                  return beanEntry.getValue().getIsOriginAllowed().test( originHeaderValue );
+                }
+              } ).build();
+            ServerContainer serverContainer = (ServerContainer) servletContext.getAttribute( ServerContainer.class.getName() );
+            if ( serverContainer != null ) {
+              serverContainer.addEndpoint( serverConfig );
+              if ( logger.isDebugEnabled() ) {
+                logger.debug( "websocket available for plugin in path " + context );
+              }
+            }
+          } catch ( DeploymentException ex ) {
+            logger.error( "Failed to register endpoint for " + beanEntry.getClass() + " on " + context + ": " + ex.getMessage(), ex );
+          }
         }
       }
     }
