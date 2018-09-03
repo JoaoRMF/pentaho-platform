@@ -25,6 +25,8 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.pentaho.platform.api.engine.IPluginManager;
 import org.pentaho.platform.api.engine.IPluginManagerListener;
+import org.pentaho.platform.engine.core.system.BasePentahoRequestContext;
+import org.pentaho.platform.engine.core.system.PentahoRequestContextHolder;
 import org.pentaho.platform.engine.core.system.PentahoSystem;
 import org.pentaho.platform.web.websocket.EndpointConfig;
 import org.springframework.beans.factory.BeanFactoryUtils;
@@ -40,12 +42,15 @@ import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import javax.websocket.DeploymentException;
 import javax.websocket.Endpoint;
+import javax.websocket.HandshakeResponse;
+import javax.websocket.server.HandshakeRequest;
 import javax.websocket.server.ServerContainer;
 import javax.websocket.server.ServerEndpointConfig;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.Predicate;
 
 /**
  * Dispatches requests to Servlets provided by BIServer plugins. To define a Servlet in a plugin, simply add a bean
@@ -184,8 +189,6 @@ public class PluginDispatchServlet implements Servlet {
     }
     pluginServletMap.clear();
 
-    ServletContext servletContext = null;
-
     Map<String, ListableBeanFactory> pluginBeanFactoryMap = getPluginBeanFactories();
 
     for ( Map.Entry<String, ListableBeanFactory> pluginBeanFactoryEntry : pluginBeanFactoryMap.entrySet() ) {
@@ -219,46 +222,8 @@ public class PluginDispatchServlet implements Servlet {
         }
       }
 
-      // Register websocket endpoints configured in the plugin
-      Map<String, EndpointConfig> wsBeans = BeanFactoryUtils.beansOfTypeIncludingAncestors( pluginBeanFactoryEntry.getValue(),
-        EndpointConfig.class, true, true );
-
-      if ( servletContext == null ) {
-        servletContext = getServletConfig().getServletContext();
-      }
-
-      for ( Map.Entry<String, EndpointConfig> beanEntry : wsBeans.entrySet() ) {
-        Map<String, Class<? extends Endpoint>> pluginEndpointConfigsList = beanEntry.getValue().getEndpoints();
-        String pluginId = pluginBeanFactoryEntry.getKey();
-
-        if ( logger.isDebugEnabled() ) {
-          logger.debug( "found " + pluginEndpointConfigsList.size() + " websocket endpoints in " + pluginBeanFactoryEntry.getKey() );
-        }
-
-        for ( Map.Entry<String, Class<? extends Endpoint>> endpointConfig : pluginEndpointConfigsList.entrySet() ) {
-          Class<? extends Endpoint> pluginEndpointClass = endpointConfig.getValue();
-          String contextPath = endpointConfig.getKey();
-          String context = "/" + pluginId + "/" + WEBSOCKET_PLUGIN_PATH_PREFIX + "/" + contextPath;
-
-          try {
-            ServerEndpointConfig serverConfig = ServerEndpointConfig.Builder.create( pluginEndpointClass, context ).
-              configurator( new ServerEndpointConfig.Configurator() {
-                @Override public boolean checkOrigin( String originHeaderValue ) {
-                  return beanEntry.getValue().getIsOriginAllowed().test( originHeaderValue );
-                }
-              } ).build();
-            ServerContainer serverContainer = (ServerContainer) servletContext.getAttribute( ServerContainer.class.getName() );
-            if ( serverContainer != null ) {
-              serverContainer.addEndpoint( serverConfig );
-              if ( logger.isDebugEnabled() ) {
-                logger.debug( "websocket available for plugin in path " + context );
-              }
-            }
-          } catch ( DeploymentException ex ) {
-            logger.error( "Failed to register endpoint for " + beanEntry.getClass() + " on " + context + ": " + ex.getMessage(), ex );
-          }
-        }
-      }
+      //configure websockets for the plugin, if any
+      configurePluginWebsockets( pluginBeanFactoryEntry );
     }
 
     // Set initialized to true at the end of the synchronized method, so
@@ -285,5 +250,97 @@ public class PluginDispatchServlet implements Servlet {
       }
     }
     return pluginBeanFactoryMap;
+  }
+
+  /**
+   * Configures a platform plugin websocket endpoints.
+   *
+   * @param pluginBeanFactoryEntry the plugin bean factory entry
+   */
+  private void configurePluginWebsockets( Map.Entry<String, ListableBeanFactory> pluginBeanFactoryEntry ) {
+    // Register websocket endpoints configured in the plugin by finding EndpointConfig beans from the plugin spring config
+    Map<String, EndpointConfig> wsBeans = BeanFactoryUtils.beansOfTypeIncludingAncestors( pluginBeanFactoryEntry.getValue(),
+      EndpointConfig.class, true, true );
+
+    for ( Map.Entry<String, EndpointConfig> beanEntry : wsBeans.entrySet() ) {
+      //Gets the list of endpoints from the configuration map
+      Map<String, Class<? extends Endpoint>> pluginEndpointConfigsList = beanEntry.getValue().getEndpoints();
+      String pluginId = pluginBeanFactoryEntry.getKey();
+
+      if ( logger.isDebugEnabled() ) {
+        logger.debug( "Found " + pluginEndpointConfigsList.size() + " websocket endpoints in " + pluginBeanFactoryEntry.getKey() );
+      }
+
+      ServletContext servletContext = getServletConfig().getServletContext();
+      String servletContextPath = servletContext.getContextPath();
+      Predicate<String> isOriginAllowedPredicate = beanEntry.getValue().getIsOriginAllowed();
+
+      for ( Map.Entry<String, Class<? extends Endpoint>> endpointConfig : pluginEndpointConfigsList.entrySet() ) {
+        Class<? extends Endpoint> pluginEndpointClass = endpointConfig.getValue();
+        String endpointConfigPath = endpointConfig.getKey();
+        String context = "/" + pluginId + "/" + WEBSOCKET_PLUGIN_PATH_PREFIX + "/" + endpointConfigPath;
+
+        try {
+          ServerEndpointConfig serverConfig = ServerEndpointConfig.Builder.create( pluginEndpointClass, context ).
+            configurator( new ServerEndpointConfig.Configurator() {
+
+              /**
+               * Override the default checkOrigin to comply with CORS enforced in the plugins.
+               * @param originHeaderValue the received origin from the request
+               * @return true if the request should be honored.
+               */
+              @Override public boolean checkOrigin( String originHeaderValue ) {
+                //we need to check regular request from the same origin as the server, and accept them
+                String localServerOrigin = getServerUrl( servletContextPath );
+                if ( localServerOrigin.equals( originHeaderValue ) ) {
+                  return true;
+                }
+                //check CORS enabled requests, using the provided predicate function
+                if ( isOriginAllowedPredicate != null ) {
+                  return isOriginAllowedPredicate.test( originHeaderValue );
+                }
+                return false;
+              }
+
+              /**
+               * The handshake is overriden to allow to set the context path, since it can be used inside the plugins.
+               * The default modifyHandshake is executed in the end.
+               * @param sec
+               * @param request
+               * @param response
+               */
+              @Override
+              public void modifyHandshake( ServerEndpointConfig sec, HandshakeRequest request, HandshakeResponse response ) {
+                PentahoRequestContextHolder.setRequestContext( new BasePentahoRequestContext( servletContextPath ) );
+                super.modifyHandshake( sec, request, response );
+              }
+
+            } ).build();
+          ServerContainer serverContainer = (ServerContainer) servletContext.getAttribute( ServerContainer.class.getName() );
+          if ( serverContainer != null ) {
+            //add the new endpoint to the server container
+            serverContainer.addEndpoint( serverConfig );
+            if ( logger.isInfoEnabled() ) {
+              logger.info( pluginId + " plugin Websocket available in path " + context );
+            }
+          } else {
+            logger.warn( pluginId + " plugin Websocket could not be configured because ServerContainer is missing" );
+          }
+        } catch ( DeploymentException ex ) {
+          logger.error( "Failed to register endpoint for " + beanEntry.getClass() + " on " + context + ": " + ex.getMessage(), ex );
+        }
+      }
+    }
+  }
+
+  /**
+   * Gets the server URL up until the application context path.
+   * @param contextPath the application context path, used to know where to split the server URL
+   * @return The server URL like http://localhost:8080
+   */
+  private String getServerUrl( String contextPath ) {
+    String fullyQualifiedServerURL = PentahoSystem.getApplicationContext().getFullyQualifiedServerURL();
+    fullyQualifiedServerURL = fullyQualifiedServerURL.replaceFirst( contextPath + "/?", "" );
+    return fullyQualifiedServerURL;
   }
 }
